@@ -1,0 +1,410 @@
+################
+|ALL FILES FULL|
+################
+#########
+1) Layout
+#########
+mirage-unikernels/
+├── README.md
+├── protocol/
+│   ├── vchan_schema.yaml
+│   └── token_spec.md
+├── auth/
+│   └── auth_model.md
+├── xen/
+│   ├── cryptod.cfg
+│   ├── entropyd.cfg
+│   ├── unlocker.cfg
+│   └── policy_pd.cfg
+├── ocaml/
+│   ├── cryptod/
+│   │   ├── dune
+│   │   ├── config.ml
+│   │   └── src/
+│   │       └── main.ml
+│   ├── entropyd/
+│   │   ├── dune
+│   │   └── src/main.ml
+│   ├── unlocker/
+│   │   ├── dune
+│   │   └── src/main.ml
+│   └── policy_pd/
+│       ├── dune
+│       └── src/main.ml
+└── docs/
+    └── deployment_notes.md
+----------------------------
+############
+2) README.md
+############
+# MirageOS 4‑Unikernel Foundations — entropyd / cryptod / unlocker / policy_pd
+
+What this bundle contains
+- protocol/vchan_schema.yaml — message formats for vchan RPCs
+- protocol/token_spec.md — capability token (COSE/CWT) specification + signing and validation rules
+- auth/auth_model.md — ACLs, trust boundaries, rotation, and threat notes
+- xen/*.cfg — Xen domain config snippets for each unikernel
+- layout.txt — recommended repo layout for building and evolving the system
+- ocaml/* — minimal Mirage/OCaml unikernel skeletons and dune stubs
+
+Goals
+- Define clear, minimal RPC schemas so policy unikernels can be built now (stateless, enforcing)
+- Ensure cryptod remains the only oracle for secrets + policy decisions
+- Define a compact signed capability token format for inter-VM authorization
+- Specify port assignments and ACLs so deployments are reproducible
+
+How to proceed
+1. Review token_spec.md and auth_model.md to confirm signing formats and lifetimes.
+2. Choose a signing primitive for cryptod (COSE with ECDSA P-256 recommended).
+3. Expand the cryptod and entropyd OCaml skeletons to implement the crypto, storage, and vchan server logic.
+4. Implement verifying clients (unlocker, policy_pd) to validate tokens and attestations.
+
+If you want, I will:
+- Expand any unikernel skeleton into a full Mirage unikernel (Xen/solo5 backends)
+- Produce dune/mirage/config.ml for your chosen backend
+- Provide unit tests and a small harness to simulate vchan messages
+
+Tell me which unikernel to expand first or say "expand all" and I’ll generate full ready-to-build sources.
+-------------------------------------
+######################
+3) protocol-vchan.yaml
+######################
+# vchan_schema.yaml
+# Canonical vchan message schema (JSON-like YAML description)
+# All messages are CBOR-encoded on the wire; top-level envelope is:
+# { "type": <string>, "body": <CBOR map> }
+#
+# Types:
+#  - entropy_pub
+#  - totp_validate_req
+#  - totp_validate_resp
+#  - token_issue_req
+#  - token_issue_resp
+#  - attestation
+#  - audit_log
+#
+# Notes:
+#  - Cryptod signs token responses and attestations with its long-term signing key.
+#  - All timestamp fields are ISO8601 in UTC or Unix epoch seconds; CBOR supports both.
+
+types:
+  entropy_pub:
+    description: "One-directional entropy publication from entropyd."
+    body:
+      drbg_version: string
+      nonce: bytes
+      entropy_chunk: bytes  # 64..512 bytes recommended
+      timestamp: string
+      signature: bytes? # optional COSE_Sign if entropyd signs outputs
+
+  totp_validate_req:
+    description: "Unlocker -> cryptod: validate a user-supplied TOTP code."
+    body:
+      request_id: string     # UUIDv4
+      operator_id: string
+      device_id: string
+      totp_code: string      # 6/8 digits
+      client_nonce: bytes
+      timestamp: string
+      attestation_chain: [bytes]? # optional attestation of unlocker
+      metadata: map?         # optional fields (IP/console/etc)
+
+  totp_validate_resp:
+    description: "cryptod -> Unlocker: yes/no plus optional ephemeral key/token"
+    body:
+      request_id: string
+      result: enum("ok","fail","rate_limited","replay")
+      reason: string?
+      capability_token: bytes?   # COSE-signed CWT token granting a short-lived capability
+      ephemeral_key: bytes?      # encrypted with unlocker ephemeral pubkey (optional)
+      expires_at: string?        # ISO8601
+      signature: bytes           # cryptod signature over the response (COSE_Sign1)
+
+  token_issue_req:
+    description: "Policy VM -> cryptod: request a capability for enforced action (read/unlock/firewall)"
+    body:
+      request_id: string
+      vm_id: string
+      requested_scope: [string]   # e.g., ["luks:decrypt","net:modify"]
+      justification: string
+      nonce: bytes
+      timestamp: string
+      attestation: bytes?         # optional attestation proving VM identity
+      metadata: map?
+
+  token_issue_resp:
+    description: "cryptod -> Policy VM: signed capability token"
+    body:
+      request_id: string
+      result: enum("ok","denied","rate_limited")
+      token: bytes?              # COSE-signed CWT
+      expires_at: string?
+      signature: bytes           # secondary signature if needed
+
+  attestation:
+    description: "Attestation structure signed by cryptod for a given action"
+    body:
+      subject_vm: string
+      subject_pubkey: bytes
+      action: string
+      nonce: bytes
+      issued_at: string
+      expires_at: string
+      signature: bytes
+
+  audit_log:
+    description: "Append-only audit records emitted by cryptod"
+    body:
+      entry_id: string
+      actor: string
+      action: string
+      target: string?
+      result: string
+      timestamp: string
+      metadata: map?
+      signature: bytes
+------------------------
+###################
+CapabilityToken.md
+###################
+# Capability Token Specification (recommended)
+
+Overview
+- Tokens are Compact COSE-signed CWT-like objects (CBOR Web Token)
+- Use COSE_Sign1 with ECDSA P-256 (ES256) or EdDSA if available.
+- Tokens are issued by cryptod and consumed by policy VMs / unlocker.
+
+Token claims (CBOR map):
+- iss (text)       : issuer identifier (cryptod domain id / key id)
+- sub (text)       : subject VM id or operator id
+- aud (text|list)  : audience(s) — which VMs/services can accept it
+- iat (int)        : issued-at (epoch seconds)
+- exp (int)        : expiration (short-lived: e.g., 30s–5m)
+- nbf (int)        : optional not-before
+- jti (text)       : token id (UUID)
+- scope (list)     : allowed scopes (e.g., ["luks:unlock", "net:update"])
+- nonce (bytes)    : anti-replay nonce from requester
+- att (map)        : optional attestation payload (signed by cryptod)
+- sig (implicit)   : COSE signature covers the whole CBOR claims
+
+Design notes
+- Tokens MUST be short-lived. Prefer 30s–120s for unlock flows; policy tokens may be slightly longer (up to 5m).
+- Tokens may embed a hashed capability value (e.g., HMAC or derived key id) instead of raw key material.
+- cryptod MUST support token revocation via a revocation list (indexed by jti) and expose a revocation-check mechanism (pushed or queryable) if long-lived tokens are used.
+
+Token exchange pattern (example)
+1. Policy VM -> cryptod: token_issue_req (includes nonce + attestation)
+2. cryptod validates attestation + ACL, returns token_issue_resp with COSE_Sign1 token
+3. Policy VM uses token to perform an action or present to another VM (like unlocker)
+4. The recipient validates COSE signature, expiry, scope and nonce.
+
+Key rotation
+- cryptod rotates signing keys periodically (e.g., daily/weekly) and publishes new public keys (via a signed metadata object) to all VMs.
+- Tokens include a `kid` header indicating which signing key was used.
+- Verification must reference the correct public key and accept a small clock skew.
+
+Recommended primitives
+- CBOR encoding (RFC 8949)
+- COSE_Sign1 (RFC 9052)
+- ECDSA P-256 (ES256) or Ed25519 (EdDSA) for compactness and performance
+
+Security considerations
+- Never include raw TOTP secrets in tokens.
+- If tokens carry encrypted key material, encrypt for the recipient using the recipient's public key and include an integrity tag.
+- Always verify nonce + jti anti-replay protections.
+-----------------------------------------------------
+###############
+5) AuthAuth.md
+###############
+# Authentication & Authorization Model (cryptod-centric)
+
+High-level trust boundaries
+- cryptod: single decision and secret authority. Must be small and auditable.
+- entropyd: randomness root; no authority over secrets or policy.
+- unlocker: operator-facing, ephemeral credentials, transient state only.
+- policy_pd: stateless enforcement daemons, never store secrets, only accept cryptod-signed tokens.
+
+ACL & capability rules
+- cryptod maintains an ACL mapping: { vm_id -> allowed_scopes }
+- All token requests must be accompanied by a nonce and (optionally) machine attestation
+- cryptod signs tokens and audit logs
+- policy PDs enforce tokens by:
+  - verifying COSE signature + kid
+  - verifying scope contains requested operation
+  - verifying expiration (exp) and not-before (nbf)
+  - verifying nonce/jti not previously used for the same vm_id + scope
+
+Attestations
+- cryptod can produce attestations for a subject VM with limited lifetime:
+  - attest(vm_id, pubkey, action, expires)
+- Attestations may be included in requests to prove previous boots or measurements.
+
+Key management
+- cryptod has a long-term signing key stored in sealed storage (protected by platform)
+- entropyd seeds cryptod's DRBG when available; cryptod maintains a local DRBG plus optional sealed seed
+- Key rotation:
+  - Generate new signing key pair inside cryptod, publish public key via signed metadata
+  - Existing tokens should be short-lived; ensure verifiers accept previous key for a bounded time window
+
+Entropy flow and ACL
+- entropyd publishes entropy chunks to an authenticated vchan endpoint
+- entropyd only accepts connections from a pre-configured set of DOMIDs/domains
+- entropyd does not accept arbitrary requests that could leak secrets
+
+Rate limiting and anti-replay
+- cryptod enforces per-device and per-operator rate limits (configurable)
+- repeated TOTP failures increment counters stored in cryptod (ephemeral or persistent)
+- cryptod emits signed audit_log entries for every authentication attempt
+
+Auditability
+- cryptod produces append-only, signed audit records
+- audit store should be shippable to an external read-only aggregator (offline review)
+- Audit entries include: request_id, actor, action, result, timestamp, metadata, signature
+
+Operational notes
+- Production deploys should:
+  - Configure a secure channel to fetch cryptod public keys into unlocker and PDs
+  - Use platform measures (Xen/PVH attestation or measured boot) to bind domain identities
+  - Limit token lifetimes and require fresh attestation for high-sensitivity operations
+-----------------------
+##############
+6) cryptod.cfg
+##############
+# cryptod Xen domain example (minimal)
+name = "cryptod"
+memory = 256
+vcpus = 1
+disk = [ 'file:/var/lib/xen/images/cryptod.img,xvda,w' ]
+vif = [ 'bridge=br0' ]
+on_poweroff = 'destroy'
+on_reboot = 'restart'
+on_crash = 'restart'
+# vchan endpoint exported to unlocker & policy PDs
+extra = "vchan-port=9001"
+# Note: use dom0 scripts to attach vchan endpoints and ACL by DomIDs
+---------------------------------------------------------------------
+###############
+7) extropyd.cfg
+###############
+# entropyd Xen domain example (minimal)
+name = "entropyd"
+memory = 128
+vcpus = 1
+disk = [ 'file:/var/lib/xen/images/entropyd.img,xvda,w' ]
+vif = [ 'bridge=br0' ]
+on_poweroff = 'destroy'
+on_reboot = 'restart'
+on_crash = 'restart'
+extra = "vchan-port=9002"
+# entropyd must be configured with an allowlist of client domIDs
+-----------------------------------------------------------------
+###############
+8) unlocker.cfg
+###############
+# unlocker Xen domain (operator console)
+name = "unlocker"
+memory = 256
+vcpus = 1
+disk = [ 'file:/var/lib/xen/images/unlocker.img,xvda,w' ]
+vif = [ 'bridge=br0' ]
+on_poweroff = 'destroy'
+on_reboot = 'restart'
+on_crash = 'restart'
+extra = "vchan-port=9003"
+# unlocker connects to cryptod:vchan on port 9001
+--------------------------------------------------
+################
+9) policypd.cfg
+################
+# policy_pd Xen domain (inter-VM policy daemon)
+name = "policy_pd"
+memory = 128
+vcpus = 1
+disk = [ 'file:/var/lib/xen/images/policy_pd.img,xvda,w' ]
+vif = [ 'bridge=br0' ]
+on_poweroff = 'destroy'
+on_reboot = 'restart'
+on_crash = 'restart'
+extra = "vchan-port=9004"
+# policy_pd will request tokens from cryptod on vchan port 9001
+----------------------------------------------------------------
+######################
+10) CryptodSkeleton.ml
+######################
+9) (* Minimal cryptod skeleton: vchan server + token issuing placeholder.
+   Fill in COSE signing, storage, and TOTP validation.
+*)
+open Lwt.Infix
+
+let () =
+  Lwt_main.run (
+    (* TODO: initialize vchan listener, load signing keys, accept requests *)
+    Lwt_io.printf "cryptod skeleton started\n"
+  )
+-----------------------------------------------
+####################
+11) OcamlCryptodDune
+####################
+(executable
+ (name main)
+ (modules main)
+ (libraries lwt lwt.unix cstruct)
+ (preprocess (pps ppx_deriving.std)))
+----------------------------------
+#######################
+12) EntropydSkeleton.ml
+#######################
+(* Minimal entropyd skeleton: publish entropy chunks on vchan *)
+open Lwt.Infix
+
+let () =
+  Lwt_main.run (
+    Lwt_io.printf "entropyd skeleton started\n"
+  )
+-----------------------------------------------
+#####################
+13) OcamlEntropydDune
+#####################
+(executable
+ (name main)
+ (modules main)
+ (libraries lwt lwt.unix cstruct))
+----------------------------------
+#######################
+14) UnlockerSkeleton.ml
+#######################
+(* Minimal unlocker skeleton: collect operator TOTP and ask cryptod *)
+open Lwt.Infix
+
+let () =
+  Lwt_main.run (
+    Lwt_io.printf "unlocker skeleton started\n"
+  )
+-----------------------------------------------
+#####################
+15) OcamlUnlockerDune
+#####################
+(executable
+ (name main)
+ (modules main)
+ (libraries lwt lwt.unix cstruct))
+-----------------------------------
+#######################
+16) PolicyPDSkeleton.ml
+#######################
+(* Minimal policy PD skeleton: request capability tokens and enforce scopes *)
+open Lwt.Infix
+
+let () =
+  Lwt_main.run (
+    Lwt_io.printf "policy_pd skeleton started\n"
+  )
+------------------------------------------------
+#####################
+17) OcamlPolicyPDDune
+#####################
+(executable
+ (name main)
+ (modules main)
+ (libraries lwt lwt.unix cstruct))
+ 

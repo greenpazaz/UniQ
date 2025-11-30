@@ -1,0 +1,5 @@
+(executable
+ (name server)
+ (public_name cryptod_server)
+ (modules server cose_ed25519 keys hkdf totp)
+ (libraries lwt lwt.unix cstruct mirage-crypto mirage-crypto-rng cborg mirage-crypto-ec))

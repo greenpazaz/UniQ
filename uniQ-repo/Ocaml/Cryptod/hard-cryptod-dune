@@ -1,0 +1,6 @@
+executable
+ (name main)
+ (public_name cryptod)
+ (modules main hkdf totp cose_sign)
+ (libraries lwt lwt.unix cstruct mirage-crypto mirage-crypto-rng cborg)
+ (preprocess (pps ppx_deriving.std)))

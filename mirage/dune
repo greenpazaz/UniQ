@@ -1,0 +1,4 @@
+(executable
+ (name unikernel)
+ (modules unikernel vchan-protocol otp keygen)
+ (libraries mirage-crypto mirage-crypto-rng mirage-vchan digestif base64))

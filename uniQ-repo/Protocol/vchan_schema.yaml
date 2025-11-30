@@ -1,0 +1,94 @@
+# vchan_schema.yaml
+# Canonical vchan message schema (JSON-like YAML description)
+# All messages are CBOR-encoded on the wire; top-level envelope is:
+# { "type": <string>, "body": <CBOR map> }
+#
+# Types:
+#  - entropy_pub
+#  - totp_validate_req
+#  - totp_validate_resp
+#  - token_issue_req
+#  - token_issue_resp
+#  - attestation
+#  - audit_log
+#
+# Notes:
+#  - Cryptod signs token responses and attestations with its long-term signing key.
+#  - All timestamp fields are ISO8601 in UTC or Unix epoch seconds; CBOR supports both.
+
+types:
+  entropy_pub:
+    description: "One-directional entropy publication from entropyd."
+    body:
+      drbg_version: string
+      nonce: bytes
+      entropy_chunk: bytes  # 64..512 bytes recommended
+      timestamp: string
+      signature: bytes? # optional COSE_Sign if entropyd signs outputs
+
+  totp_validate_req:
+    description: "Unlocker -> cryptod: validate a user-supplied TOTP code."
+    body:
+      request_id: string     # UUIDv4
+      operator_id: string
+      device_id: string
+      totp_code: string      # 6/8 digits
+      client_nonce: bytes
+      timestamp: string
+      attestation_chain: [bytes]? # optional attestation of unlocker
+      metadata: map?         # optional fields (IP/console/etc)
+
+  totp_validate_resp:
+    description: "cryptod -> Unlocker: yes/no plus optional ephemeral key/token"
+    body:
+      request_id: string
+      result: enum("ok","fail","rate_limited","replay")
+      reason: string?
+      capability_token: bytes?   # COSE-signed CWT token granting a short-lived capability
+      ephemeral_key: bytes?      # encrypted with unlocker ephemeral pubkey (optional)
+      expires_at: string?        # ISO8601
+      signature: bytes           # cryptod signature over the response (COSE_Sign1)
+
+  token_issue_req:
+    description: "Policy VM -> cryptod: request a capability for enforced action (read/unlock/firewall)"
+    body:
+      request_id: string
+      vm_id: string
+      requested_scope: [string]   # e.g., ["luks:decrypt","net:modify"]
+      justification: string
+      nonce: bytes
+      timestamp: string
+      attestation: bytes?         # optional attestation proving VM identity
+      metadata: map?
+
+  token_issue_resp:
+    description: "cryptod -> Policy VM: signed capability token"
+    body:
+      request_id: string
+      result: enum("ok","denied","rate_limited")
+      token: bytes?              # COSE-signed CWT
+      expires_at: string?
+      signature: bytes           # secondary signature if needed
+
+  attestation:
+    description: "Attestation structure signed by cryptod for a given action"
+    body:
+      subject_vm: string
+      subject_pubkey: bytes
+      action: string
+      nonce: bytes
+      issued_at: string
+      expires_at: string
+      signature: bytes
+
+  audit_log:
+    description: "Append-only audit records emitted by cryptod"
+    body:
+      entry_id: string
+      actor: string
+      action: string
+      target: string?
+      result: string
+      timestamp: string
+      metadata: map?
+      signature: bytes

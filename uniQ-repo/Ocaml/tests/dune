@@ -1,0 +1,3 @@
+(executables
+ (names test_cose test_hkdf_totp)
+ (libraries cstruct mirage-crypto mirage-crypto-rng cborg mirage-crypto-ec))
