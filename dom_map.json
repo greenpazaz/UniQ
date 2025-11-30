@@ -1,0 +1,13 @@
+```json name=auth/domain_map.json
+{
+  "version": 1,
+  "deployment": "example-cluster-1",
+  "doms": [
+    { "dom_id": 3, "name": "cryptod", "expected_kv": "cryptod-v1" },
+    { "dom_id": 4, "name": "entropyd", "expected_kv": "entropyd-v1" },
+    { "dom_id": 5, "name": "unlocker", "expected_kv": "unlocker-v1" },
+    { "dom_id": 6, "name": "policy_pd", "expected_kv": "policy_pd-v1" },
+    { "dom_id": 7, "name": "netfw_pd", "expected_kv": "netfw_pd-v1" },
+    { "dom_id": 8, "name": "ivm_pd", "expected_kv": "ivm_pd-v1" }
+  ]
+}
